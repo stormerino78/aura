@@ -84,6 +84,8 @@ contract DynamicRiskGovernor {
     mapping(address => DataStructures.ModuleSnapshotHistory) public moduleSnapshotHistories;
     // Fine-tune how a module should behave in different market regimes (module address => (regime ID => modifier value))
     mapping(address => mapping(uint8 => uint256)) public marketRegimeModifiers;
+    // Define unique multi-point curve for every single module
+    mapping(address => Point[]) public sharpeFactorCurves;
 
     // --- Governable Parameters ---
     // Modifiable by the governor
@@ -100,6 +102,7 @@ contract DynamicRiskGovernor {
     uint256 public highVolThreshold;
     uint8 public trendLookback; // Number of periods for Simple Moving Average (SMA) trend
     uint8 public regimeConfirmationPeriod; // number of blocks to confirm a regime change
+    uint256 public maxSharpeFactorSlope; // Governable slope limit
 
     // --- Modifiers ---
     modifier onlyGovernor() {
@@ -160,6 +163,7 @@ contract DynamicRiskGovernor {
     function calculateNewAllocation(
         address module,
         uint256 totalVaultAssets,
+        int256 netCapitalFlow,
         int256 tradingPnl
     ) external returns (uint256 desiredCollateral) {
         // --- Pre-computation Checks ---
@@ -181,7 +185,7 @@ contract DynamicRiskGovernor {
         DataStructures.MarketRegime regime = assetMarketRegime[moduleConfigs[module].assetId];
 
         // --- Update Module KPIs ---
-        (uint256 sharpeProxy, uint256 mdd) = _updateAndGetKPIs(module, tradingPnl);
+        (uint256 sharpeProxy, uint256 mdd) = _updateAndGetKPIs(module, netCapitalFlow, tradingPnl);
 
         // --- Synthesize into Modifiers ---
         uint256 perfModifier = _calculatePerformanceModifier(sharpeProxy, mdd);
@@ -307,8 +311,7 @@ contract DynamicRiskGovernor {
         uint256 volatility = newVariance.sqrt(); // sqrt of the full precision value
 
         // Calculate Trend (Simple price change)
-        // A more complex SMA implementation is possible but this is gas efficient
-        int256 trend = int256(price) - int256(lastPrice);
+        int8 trend = _calculateSMATrend(assetId, price);
 
         // Classify Regime
         DataStructures.MarketRegime newRegime;
@@ -334,17 +337,36 @@ contract DynamicRiskGovernor {
     }
 
     /**
-     * @dev Updates and calculates module KPIs: Stateful MDD and Sharpe Proxy.
-     */
-    function _updateAndGetKPIs(address module, int256 tradingPnl) private returns (uint256 sharpeProxy, uint256 maxDrawdown) {
+    * @dev Updates and calculates module KPIs: Stateful MDD and Sharpe Proxy.
+    * @param module The module address.
+    * @param netCapitalFlow The net capital deposit or withdrawal.
+    * @param tradingPnl The pure performance profit or loss.
+    */
+    function _updateAndGetKPIs(
+        address module,
+        int256 netCapitalFlow,
+        int256 tradingPnl
+    ) private returns (uint256 sharpeProxy, uint256 maxDrawdown) {
         DataStructures.ModuleRiskState storage riskState = moduleRiskStates[module];
 
         // --- Update navPerShare and Max Drawdown (MDD) (Stateful O(1) update) ---
         // Goal is to keep in memory the peak of performance and the maximal drowdawn that ever happened on a module
 
         // if totalShares = 0 oldNavPerShare = 0 else oldNavPerShare = totalNAV / totalShares
-        uint256 oldNavPerShare = riskState.totalShares == 0 ? 0 : riskState.totalNAV.divWad(riskState.totalShares);
         
+        if (netCapitalFlow != 0 && riskState.totalNAV > 0) {
+            if (netCapitalFlow > 0) { // Deposit
+                uint256 sharesToMint = uint256(netCapitalFlow).mulWad(riskState.totalShares) / riskState.totalNAV;
+                riskState.totalNAV += uint256(netCapitalFlow);
+                riskState.totalShares += sharesToMint;
+            } else { // Withdrawal
+                uint256 capitalToWithdraw = uint256(-netCapitalFlow);
+                uint256 sharesToBurn = capitalToWithdraw.mulWad(riskState.totalShares) / riskState.totalNAV;
+                riskState.totalNAV -= capitalToWithdraw;
+                riskState.totalShares -= sharesToBurn;
+            }
+        }
+
         // Adding tradingPnl to  module's Net Asset Value
         riskState.totalNAV = uint256(int256(riskState.totalNAV) + tradingPnl);
         
@@ -356,17 +378,17 @@ contract DynamicRiskGovernor {
             // Update MDD
             uint256 peak = riskState.peakNavPerShare;
             if (newNavPerShare > peak) {
-                riskState.peakNavPerShare = newNavPerShare; // Profit generated as each share is more valuable
+                riskState.peakNavPerShare = newNavPerShare;
             } else {
-                uint256 currentDrawdown = (peak - newNavPerShare).divWad(peak); // current drawdown coef
+                uint256 currentDrawdown = (peak - newNavPerShare).mulWad(FixedPointMath.WAD) / peak;
                 if (currentDrawdown > riskState.maxDrawdown) {
                     riskState.maxDrawdown = currentDrawdown;
                 }
             }
-        } else { // First-time initialization (Values are then again updated when deposits are made)
+        } else { // First-time initialization
             newNavPerShare = FixedPointMath.WAD;
-            riskState.totalNAV = FixedPointMath.WAD;
-            riskState.totalShares = FixedPointMath.WAD;
+            riskState.totalNAV = uint256(int256(riskState.totalNAV) + netCapitalFlow); // Initial deposit
+            riskState.totalShares = riskState.totalNAV; // 1 share per unit of initial capital
             riskState.peakNavPerShare = FixedPointMath.WAD;
         }
 
@@ -392,68 +414,166 @@ contract DynamicRiskGovernor {
      */
     function _calculateSharpeProxy(address module) private view returns (uint256) {
         DataStructures.ModuleSnapshotHistory storage history = moduleSnapshotHistories[module];
-        uint256 count = history.snapshotCount;
+        uint8 count = history.snapshotCount;
         if (count < 2) return FixedPointMath.WAD; // Not enough data, return neutral
 
-        uint256[] memory periodReturns = new uint256[](count - 1);
+        uint8 lookbackN = moduleConfigs[module].lookbackPeriodN;
+
+        // Calculate how many return periods we can analyze from the snapshots
+        uint8 returnCount = count - 1;
+
+        // Create a temporary array in memory to hold the returns for the second pass
+        int256[] memory periodReturns = new int256[](returnCount);
         int256 totalReturns = 0;
 
-        // Calculate period-over-period returns
-        for (uint256 i = 0; i < count - 1; i++) {
+        // --- First Pass: Calculate and store each period's return ---
+        for (uint8 i = 0; i < returnCount; i++) {
             // Ready data backwards from most recent entries
-            uint256 currentIdx = (history.nextSnapshotIndex + history.navPerShareHistory.length - 1 - i) % history.navPerShareHistory.length;
-            uint256 prevIdx = (history.nextSnapshotIndex + history.navPerShareHistory.length - 2 - i) % history.navPerShareHistory.length;
+            uint8 currentIdx = (history.nextSnapshotIndex + lookbackN - 1 - i) % lookbackN;
+            uint8 prevIdx = (history.nextSnapshotIndex + lookbackN - 2 - i) % lookbackN;
+
             uint256 currentNav = history.navPerShareHistory[currentIdx];
             uint256 prevNav = history.navPerShareHistory[prevIdx];
-            // Exception when prevNav=0 (only one period)
-            if (prevNav == 0) continue;
             
-            int256 r = int256(currentNav) - int256(prevNav);
-            periodReturns[i] = uint256(r); // absolute value of the difference of performance
-            totalReturns += r.mulWad(int256(FixedPointMath.WAD)) / int256(prevNav); // coef of return (+/-)
-        }
-
-        int256 avgReturn = totalReturns / int256(count - 1);
-        int256 excessReturn = avgReturn - int256(riskFreeRate);
-
-        // Calculate Mean Absolute Deviation (MAD)
-        int256 mad = 0;
-        for(uint256 i = 0; i < periodReturns.length; ++i) {
-            if(sharpeMetricType == DataStructures.SharpeMetricType.DOWNSIDE_MAD) {
-                // Only consider returns less than the average (downside deviation)
-                if (int256(periodReturns[i]) < avgReturn) {
-                    mad += Math.abs(avgReturn, int256(periodReturns[i]));
-                }
-            } else { // Full MAD
-                mad += Math.abs(avgReturn, int256(periodReturns[i]));
+            // Exception when prevNav=0, we skip this invalid period
+            if (prevNav > 0) {
+                int256 r = int256(currentNav) - int256(prevNav);
+                // Calculate the percentage return for this period
+                int256 periodReturn = r.mulWad(int256(FixedPointMath.WAD)) / int256(prevNav);
+                periodReturns[i] = periodReturn;
+                totalReturns += periodReturn;
             }
         }
-        mad /= int256(periodReturns.length);
-        
-        // Handle edge cases and calculate final ratio
-        if (mad == 0) return type(uint256).max; // No downside deviation, return max value
-        if (uint256(Math.abs(mad, 0)) < minMadThreshold) {
-            mad = int256(minMadThreshold);
+
+        // --- Calculations between passes ---
+        int256 avgReturn = totalReturns / int256(returnCount);
+        int256 excessReturn = avgReturn - int256(riskFreeRate);
+
+        // --- Second Pass: Calculate Mean Absolute Deviation (MAD) ---
+        int256 totalDeviation = 0;
+        for (uint8 i = 0; i < returnCount; i++) {
+            if (sharpeMetricType == DataStructures.SharpeMetricType.DOWNSIDE_MAD) {
+                // Only consider returns less than the average for downside deviation
+                if (periodReturns[i] < avgReturn) {
+                    totalDeviation += Math.absDiff(avgReturn, periodReturns[i]);
+                }
+            } else { // Full MAD
+                totalDeviation += Math.absDiff(avgReturn, periodReturns[i]);
+            }
         }
 
+        int256 mad = totalDeviation / int256(returnCount);
+
+        // --- Final Stability Checks ---
+        if (mad == 0) return type(uint256).max; // No deviation, return max value
+        
+        // Use the minimum threshold if calculated MAD is too low.
+        if (uint256(Math.abs(mad)) < minMadThreshold) {
+            mad = int256(minMadThreshold);
+        }
+        
+        // Ensure we don't try to divide by a negative number if MAD is somehow negative.
+        if (mad <= 0) return 0;
+
+        // Calculate the final ratio: Excess Return / Volatility (MAD).
         return uint256(excessReturn).divWad(uint256(mad));
     }
-
+        
     /**
-     * @dev Calculates the final performance modifier based on Sharpe and MDD.
-     */
-    function _calculatePerformanceModifier(uint256 sharpeProxy, uint256 mdd) private view returns (uint256) {
+    * @dev Calculates the final performance modifier based on Sharpe and MDD,
+    * using a piecewise linear function for the Sharpe Factor.
+    */
+    function _calculatePerformanceModifier(
+        address module,
+        uint256 sharpeProxy,
+        uint256 mdd
+    ) private view returns (uint256) {
         // MDD Penalty: If MDD exceeds the liquidation threshold, allocation is halted.
         if (mdd >= mddLiquidationThreshold) return 0;
-        
-        // A simple linear penalty for this example (mdd / mdd liquidation price). The spec's piecewise function can be implemented here.
+
+        // Linear penalty for MDD.
         uint256 mddPenaltyFactor = mdd.mulWad(FixedPointMath.WAD).divWad(mddLiquidationThreshold);
 
-        // Sharpe Factor: A simple bounded factor. The spec's piecewise function would provide smoother scaling.
-        uint256 sharpeFactor = FixedPointMath.WAD; // Neutral
-        if (sharpeProxy > FixedPointMath.WAD.mulWad(2)) sharpeFactor = FixedPointMath.WAD.mulWad(12) / 10; // 1.2x
-        else if (sharpeProxy < FixedPointMath.WAD.divWad(2)) sharpeFactor = FixedPointMath.WAD.mulWad(8) / 10; // 0.8x
-        // Add both mdd ratio with sharp proxy to define the allocation/desalloacation
+        // --- Sharpe Factor Calculation using Piecewise Linear Interpolation ---
+        Point[] storage curve = sharpeFactorCurves[module];
+        uint256 sharpeFactor = FixedPointMath.WAD; // Default to neutral
+
+        if (curve.length >= 2) {
+            int256 sharpeProxySigned = int256(sharpeProxy);
+
+            // Find the segment where the sharpeProxy falls
+            for (uint i = 0; i < curve.length - 1; i++) {
+                Point memory p1 = curve[i];
+                Point memory p2 = curve[i+1];
+
+                if (sharpeProxySigned >= p1.x && sharpeProxySigned <= p2.x) {
+                    // Perform linear interpolation: y = y1 + (x - x1) * (y2 - y1) / (x2 - x1)
+                    int256 x_range = p2.x - p1.x;
+                    if (x_range == 0) { // Avoid division by zero, use the lower point's factor
+                        sharpeFactor = p1.y;
+                        break;
+                    }
+                    int256 y_range = int256(p2.y) - int256(p1.y);
+                    int256 x_delta = sharpeProxySigned - p1.x;
+
+                    int256 interpolated_y_delta = (x_delta * y_range) / x_range;
+                    sharpeFactor = uint256(int256(p1.y) + interpolated_y_delta);
+                    break;
+                }
+            }
+            // Handle out-of-bounds cases (use the first or last point's factor)
+            if (sharpeProxySigned < curve[0].x) sharpeFactor = curve[0].y;
+            if (sharpeProxySigned > curve[curve.length - 1].x) sharpeFactor = curve[curve.length - 1].y;
+        }
+        // Final modifier calculation
         return sharpeFactor.mulWad(FixedPointMath.WAD - mddPenaltyFactor);
+    }
+
+
+    /**
+    * @dev Calculates the short-term market trend using a Simple Moving Average (SMA).
+    * @param assetId The ID of the asset to analyze.
+    * @param newPrice The latest price from the oracle.
+    * @return trend -1 for negative, 1 for positive, 0 for neutral.
+    */
+    function _calculateSMATrend(uint32 assetId, uint256 newPrice) private returns (int8 trend) {
+        DataStructures.PriceHistory storage history = assetPriceHistories[assetId];
+        uint8 lookback = trendLookback; // Governable parameter
+
+        // Initialize buffer if it's empty
+        if (history.prices.length != lookback) {
+            delete history.prices; // Clear any old data
+            for (uint i = 0; i < lookback; i++) {
+                history.prices.push(0);
+            }
+        }
+
+        // Update the circular buffer with the new price
+        history.prices[history.nextWriteIndex] = newPrice;
+        history.nextWriteIndex = (history.nextWriteIndex + 1) % lookback;
+
+        // Calculate the SMA
+        uint256 sum = 0;
+        uint8 points = 0;
+        for (uint8 i = 0; i < lookback; i++) {
+            if (history.prices[i] > 0) {
+                sum += history.prices[i];
+                points++;
+            }
+        }
+
+        // Not enough data for a meaningful SMA yet
+        if (points < lookback) return 0;
+
+        uint256 sma = sum / lookback;
+
+        // Determine trend
+        if (newPrice > sma) {
+            return 1; // Positive trend
+        } else if (newPrice < sma) {
+            return -1; // Negative trend
+        } else {
+            return 0; // Neutral trend
+        }
     }
 }

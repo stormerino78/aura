@@ -65,4 +65,26 @@ library DataStructures {
         uint64 timestamp;
         uint256 navPerShare;
     }
+
+    /**
+     * @notice Stores a rolling history of recent oracle prices in a fixed-size circular buffer.
+     * This data is used to calculate the short-term market trend via a Simple Moving Average (SMA).
+     * @param prices A fixed-size array holding the most recent oracle price snapshots.
+     * @param nextWriteIndex A pointer indicating the next array index to be overwritten, facilitating the circular buffer.
+     */
+    struct PriceHistory {
+        uint256[] prices;
+        uint8 nextWriteIndex;
+    }
+
+    /**
+     * @notice Defines a single coordinate (x, y) for the piecewise linear function
+     * mapping a Sharpe Proxy score to a Sharpe Factor.
+     * @param x The input value representing the Sharpe Proxy score (can be negative).
+     * @param y The output value representing the resulting Sharpe Factor, formatted as a WAD (18 decimals).
+     */
+    struct Point {
+        int256 x;  // SharpeProxy score
+        uint256 y; // SharpeFactor (WAD)
+    }
 }

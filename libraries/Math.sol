@@ -68,21 +68,4 @@ library Math {
             return (sortedArr[n / 2 - 1] + sortedArr[n / 2]) / 2;
         }
     }
-
-    /**
-     * @dev Calculates the integer square root of a number.
-     * @notice Uses a gas-efficient binary search algorithm.
-     * @param x The number to calculate the square root of.
-     * return The integer square root of x.
-     */
-    function sqrt(uint256 x) internal pure returns (uint256 y) {
-        if (x == 0) return 0;
-        // Starting with x / 2 is a good initial guess
-        y = x;
-        uint256 z = (x / 2) + 1;
-        while (z < y) {
-            y = z;
-            z = (x / z + z) / 2;
-        }
-    }
 }

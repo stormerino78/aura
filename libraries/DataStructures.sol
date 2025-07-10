@@ -7,7 +7,6 @@ pragma solidity 0.8.24;
  * @dev Consolidating structs and enums here keeps the main contract cleaner and more organized.
  */
 library DataStructures {
-    uint256 public constant WAD = 1e18; // 18 decimals of precision
 
     /**
      * @notice Defines the possible market regimes as classified by the DRG.
@@ -54,16 +53,6 @@ library DataStructures {
         uint256 totalShares;
         uint256 peakNavPerShare;
         uint256 maxDrawdown;
-    }
-
-    /**
-     * @notice A single snapshot of a module's performance history.
-     * @param timestamp The block timestamp of the snapshot.
-     * @param navPerShare The NAV per share at the time of the snapshot.
-     */
-    struct Snapshot {
-        uint64 timestamp;
-        uint256 navPerShare;
     }
 
     /**

@@ -10,13 +10,13 @@ import "./libraries/Math.sol";
 /**
  * @title DynamicRiskGovernor (DRG)
  * @author Aura Protocol
- * @notice This contract is the core risk and allocation engine for the Aura protocol.
+ * @notice This contract is the core risk and allocation engine for the Aura protocol
  * It dynamically adjusts capital allocations for various Alpha Modules based on their
  * performance (Sharpe-like ratio, Max Drawdown) and real-time market conditions
- * (volatility, trend) to maximize risk-adjusted returns for the vault.
+ * (volatility, trend) to maximize risk-adjusted returns for the vault
  * It is designed with modularity, gas efficiency, and robust security features like
- * oracle circuit breakers and mandatory governance timelocks.
- * @dev See the Aura Protocol Technical Specification for detailed formulas and logic.
+ * oracle circuit breakers and mandatory governance timelocks
+ * @dev See the Aura Protocol Technical Specification for detailed formulas and logic
  */
 contract DynamicRiskGovernor {
     // "attaches" all the functions inside FixedPointMath library to uint256 data type
@@ -84,6 +84,8 @@ contract DynamicRiskGovernor {
     mapping(address => DataStructures.ModuleSnapshotHistory) public moduleSnapshotHistories;
     // Fine-tune how a module should behave in different market regimes (module address => (regime ID => modifier value))
     mapping(address => mapping(uint8 => uint256)) public marketRegimeModifiers;
+    // Tracks pending regime changes for each asset before they are confirmed
+    mapping(uint32 => DataStructures.PendingRegimeState) public pendingRegimeStates;
     // Define unique multi-point curve for every single module
     mapping(address => Point[]) public sharpeFactorCurves;
 
@@ -134,30 +136,29 @@ contract DynamicRiskGovernor {
     // --- Main External Functions ---
 
     /**
-     * @notice Registers a new Alpha Module, linking it to an approved template and setting initial config.
-     * @param module The address of the Alpha Module contract.
-     * @param config The configuration for this specific module.
+     * @notice Registers a new Alpha Module, linking it to an approved template and setting initial config and trend calculation
+     * @param module The address of the Alpha Module contract
+     * @param config The configuration for this specific module
      */
     function registerModule(address module, DataStructures.ModuleConfig calldata config) external onlyGovernor {
         bytes32 deployedBytecodeHash = keccak256(module.code);
         // Check if the code of the module address contract is approved through hashes before registration
         if (!approvedTemplateHashes[deployedBytecodeHash]) revert InvalidTemplate();
 
+        // Ensure the lookbackPeriodN is valid for the fixed-size array
+        require(config.lookbackPeriodN > 0 && config.lookbackPeriodN <= DataStructures.MAX_KPI_LOOKBACK, "Invalid KPI lookback");
         moduleConfigs[module] = config;
-        // Initialize circular buffer module's perf history with governable size N
-        moduleSnapshotHistories[module].navPerShareHistory.length = config.lookbackPeriodN;
-        moduleSnapshotHistories[module].timestampHistory.length = config.lookbackPeriodN;
 
         emit ModuleRegistered(module, deployedBytecodeHash, config);
     }
 
     /**
-     * @notice The core state-changing function called during rebalancing.
-     * @dev It updates all KPIs and market data, then calculates the new desired collateral for a module.
-     * @param module The address of the Alpha Module to rebalance.
-     * @param totalVaultAssets The total assets in the main vault, used for base allocation.
-     * @param tradingPnl The module's pure trading profit/loss since the last rebalance.
-     * @return desiredCollateral The new target collateral allocation for the module.
+     * @notice The core state-changing function called during rebalancing
+     * @dev It updates all KPIs and market data, then calculates the new desired collateral for a module
+     * @param module The address of the Alpha Module to rebalance
+     * @param totalVaultAssets The total assets in the main vault, used for base allocation
+     * @param tradingPnl The module's pure trading profit/loss since the last rebalance
+     * @return desiredCollateral The new target collateral allocation for the module
      */
 
     function calculateNewAllocation(
@@ -233,6 +234,115 @@ contract DynamicRiskGovernor {
         emit CircuitBreakerTripped(false);
     }
 
+    
+    /**
+     * @notice Sets the divergence percentage between oracles that triggers the circuit breaker.
+     * @param _threshold The new threshold, formatted as a WAD (e.g., 5e16 for 5%).
+     */
+    function setOracleDivergenceThreshold(uint256 _threshold) external onlyGovernor withTimelock {
+        require(_threshold < FixedPointMath.WAD, "Divergence must be < 100%");
+        oracleDivergenceThreshold = _threshold;
+        emit ParameterUpdated("oracleDivergenceThreshold", _threshold);
+    }
+
+    /**
+     * @notice Sets the type of Mean Absolute Deviation to use for the Sharpe Proxy.
+     * @param _type The new metric type (DOWNSIDE_MAD or FULL_MAD).
+     */
+    function setSharpeMetricType(DataStructures.SharpeMetricType _type) external onlyGovernor withTimelock {
+        sharpeMetricType = _type;
+        emit ParameterUpdated("sharpeMetricType", uint256(_type));
+    }
+
+    /**
+     * @notice Sets the minimum MAD value to prevent Sharpe instability at low volatility.
+     * @param _threshold The new minimum threshold (WAD).
+     */
+    function setMinMadThreshold(uint256 _threshold) external onlyGovernor withTimelock {
+        minMadThreshold = _threshold;
+        emit ParameterUpdated("minMadThreshold", _threshold);
+    }
+
+    /**
+     * @notice Sets the decay factor (lambda) for the EWMA volatility calculation.
+     * @param _factor The new decay factor (WAD), must be less than 1.
+     */
+    function setVolatilityDecayFactor(uint256 _factor) external onlyGovernor withTimelock {
+        require(_factor < FixedPointMath.WAD, "Decay factor must be < 1");
+        volatilityDecayFactor = _factor;
+        emit ParameterUpdated("volatilityDecayFactor", _factor);
+    }
+
+    /**
+     * @notice Sets the volatility thresholds for classifying market regimes.
+     * @param _low The new low volatility threshold.
+     * @param _high The new high volatility threshold.
+     */
+    function setVolatilityThresholds(uint256 _low, uint256 _high) external onlyGovernor withTimelock {
+        require(_low < _high, "Low threshold must be < high threshold");
+        lowVolThreshold = _low;
+        highVolThreshold = _high;
+        emit ParameterUpdated("lowVolThreshold", _low);
+        emit ParameterUpdated("highVolThreshold", _high);
+    }
+
+    /**
+     * @notice Sets the lookback period for the trend-calculating SMA.
+     * @param _lookback The new number of periods, must be within the fixed array bounds.
+     */
+    function setTrendLookback(uint8 _lookback) external onlyGovernor withTimelock {
+        require(_lookback > 0 && _lookback <= DataStructures.MAX_TREND_LOOKBACK, "Invalid trend lookback");
+        trendLookback = _lookback;
+        emit ParameterUpdated("trendLookback", _lookback);
+    }
+
+    /**
+     * @notice Sets the number of blocks a regime condition must persist before being confirmed.
+     * @param _period The new confirmation period in blocks.
+     */
+    function setRegimeConfirmationPeriod(uint8 _period) external onlyGovernor withTimelock {
+        require(_period > 0, "Confirmation period must be > 0");
+        regimeConfirmationPeriod = _period;
+        emit ParameterUpdated("regimeConfirmationPeriod", _period);
+    }
+
+    /**
+     * @notice Sets the maximum allowed slope for any segment of a module's Sharpe Factor curve.
+     * @param _slope The new maximum slope (WAD).
+     */
+    function setMaxSharpeFactorSlope(uint256 _slope) external onlyGovernor withTimelock {
+        maxSharpeFactorSlope = _slope;
+        emit ParameterUpdated("maxSharpeFactorSlope", _slope);
+    }
+
+    /**
+     * @notice Sets the entire performance curve for a specific module.
+     * @dev This allows for granular, per-module performance incentives.
+     * @param module The address of the Alpha Module to configure.
+     * @param newCurve The array of Points defining the new curve.
+     */
+    function setSharpeFactorCurve(address module, DataStructures.Point[] calldata newCurve) external onlyGovernor {
+        require(newCurve.length >= 2, "Curve must have at least 2 points");
+
+        for (uint i = 0; i < newCurve.length - 1; i++) {
+            DataStructures.Point memory p1 = newCurve[i];
+            DataStructures.Point memory p2 = newCurve[i+1];
+
+            require(p2.x > p1.x, "Curve x-values must be increasing");
+
+            int256 x_range = p2.x - p1.x;
+            int256 y_range = int256(p2.y) - int256(p1.y);
+            
+            // Check slope against the max slope parameter
+            require(
+                uint256((y_range * 1e18) / x_range) <= maxSharpeFactorSlope,
+                "Curve slope exceeds maxSharpeFactorSlope"
+            );
+        }
+        
+        sharpeFactorCurves[module] = newCurve;
+    }
+    
     function setRiskFreeRate(uint256 _rate) external onlyGovernor withTimelock {
         riskFreeRate = _rate;
         emit ParameterUpdated("riskFreeRate", _rate);
@@ -253,7 +363,7 @@ contract DynamicRiskGovernor {
 
     /**
      * @dev Fetches prices from all registered oracles for an asset, calculates the median,
-     * and checks for divergence to trip the circuit breaker.
+     * and checks for divergence to trip the circuit breaker
      */
     function _getMedianPrice(address module) private returns (uint256 medianPrice, bool tripped) {
         uint32 assetId = moduleConfigs[module].assetId;
@@ -281,8 +391,8 @@ contract DynamicRiskGovernor {
     }
 
     /**
-     * @dev Updates the market regime based on volatility and trend.
-     * @notice Implements EWMA for volatility and a simple trend indicator.
+     * @dev Updates the market regime based on volatility and trend
+     * @notice Implements EWMA for volatility and a simple trend indicator
      */
     function _updateMarketRegime(address module, uint256 price) private {
         uint32 assetId = moduleConfigs[module].assetId;
@@ -292,10 +402,7 @@ contract DynamicRiskGovernor {
             return; // Not enough data yet
         }
 
-        // Calculate Volatility (EWMA of squared returns)
-        // New Volatility = square root of (New Variance)
-        // New Variance = (Old Variance x Decay Factor) + (Recent Squared Return x (1 - Decay Factor))
-
+        // ---  Calculate Volatility and Trend to find the candidate regime ---
         // Calculate Price Change. WAD Multiplication to avoid division loose of information between unscaled numbers
         uint256 returnsSq = (Math.absDiff(price, lastPrice)).mulWad(FixedPointMath.WAD);
         // Calculate % return
@@ -303,44 +410,59 @@ contract DynamicRiskGovernor {
         // Squaring % return
         returnsSq = returnsSq.mulWad(returnsSq);
 
-        uint256 currentVariance = ewmaVariance[assetId];
-
         uint256 newVariance = (currentVariance.mulWad(volatilityDecayFactor)) // volatilityDecayFactor set by governor
             + (returnsSq.mulWad(FixedPointMath.WAD - volatilityDecayFactor));
         ewmaVariance[assetId] = newVariance / FixedPointMath.WAD;
         uint256 volatility = newVariance.sqrt(); // sqrt of the full precision value
-
         // Calculate Trend (Simple price change)
         int8 trend = _calculateSMATrend(assetId, price);
 
         // Classify Regime
-        DataStructures.MarketRegime newRegime;
+        DataStructures.MarketRegime candidateRegime;
         if (volatility < lowVolThreshold) {
-            newRegime = DataStructures.MarketRegime.LOW_VOL;
+            candidateRegime = DataStructures.MarketRegime.LOW_VOL;
         } else if (volatility >= highVolThreshold) {
             // HIGH_VOL_FAVORABLE: High Volatility + price going up
             // HIGH_VOL_UNFAVORABLE: High Volatility + price going down
-            if (trend > 0) newRegime = DataStructures.MarketRegime.HIGH_VOL_FAVORABLE;
-            else newRegime = DataStructures.MarketRegime.HIGH_VOL_UNFAVORABLE;
+            if (trend > 0) candidateRegime = DataStructures.MarketRegime.HIGH_VOL_FAVORABLE;
+            else candidateRegime = DataStructures.MarketRegime.HIGH_VOL_UNFAVORABLE;
         } else {
             // lowVolThreshold <= volatility < highVolThreshold
-            newRegime = DataStructures.MarketRegime.NORMAL;
+            candidateRegime = DataStructures.MarketRegime.NORMAL;
         }
-        
-        DataStructures.MarketRegime oldRegime = assetMarketRegime[assetId];
-        if(newRegime != oldRegime) {
-            emit MarketRegimeChanged(assetId, oldRegime, newRegime);
-            assetMarketRegime[assetId] = newRegime;
+
+        // --- Process the pending regime state ---
+        // Aims to provide stability and avoid market noise in decisions and changes on sustained market conditions
+        // Change market condition -> new pending state and start timer -> if condition stay the same, increment timer -> Condition is stated if reaches the regimeConfirmationPeriod.
+        DataStructures.PendingRegimeState storage pendingState = pendingRegimeStates[assetId];
+        DataStructures.MarketRegime currentRegime = assetMarketRegime[assetId];
+        // If the current market conditions match the pending regime, increment the counter
+        if (candidateRegime == pendingState.regime) {
+            pendingState.confirmationCounter++;
+        } else {
+            // Otherwise, the conditions have changed and reset the pending state to the new candidate
+            pendingState.regime = candidateRegime;
+            pendingState.confirmationCounter = 1;
         }
-        
+
+        // --- Commit the regime change if the confirmation period is met ---
+        if (pendingState.confirmationCounter >= regimeConfirmationPeriod) {
+            // Only commit and emit an event if the new confirmed regime is different from the current one
+            if (pendingState.regime != currentRegime) {
+                emit MarketRegimeChanged(assetId, currentRegime, pendingState.regime);
+                assetMarketRegime[assetId] = pendingState.regime;
+            }
+            // Clear the pending state after commitment
+            delete pendingRegimeStates[assetId];
+        }
         lastSeenPrice[assetId] = price;
     }
 
     /**
-    * @dev Updates and calculates module KPIs: Stateful MDD and Sharpe Proxy.
-    * @param module The module address.
-    * @param netCapitalFlow The net capital deposit or withdrawal.
-    * @param tradingPnl The pure performance profit or loss.
+    * @dev Updates and calculates module KPIs: Stateful MDD and Sharpe Proxy
+    * @param module The module address
+    * @param netCapitalFlow The net capital deposit or withdrawal
+    * @param tradingPnl The pure performance profit or loss
     */
     function _updateAndGetKPIs(
         address module,
@@ -361,6 +483,9 @@ contract DynamicRiskGovernor {
                 riskState.totalShares += sharesToMint;
             } else { // Withdrawal
                 uint256 capitalToWithdraw = uint256(-netCapitalFlow);
+                if (capitalToWithdraw > riskState.totalNAV) {
+                    capitalToWithdraw = riskState.totalNAV;
+                }
                 uint256 sharesToBurn = capitalToWithdraw.mulWad(riskState.totalShares) / riskState.totalNAV;
                 riskState.totalNAV -= capitalToWithdraw;
                 riskState.totalShares -= sharesToBurn;
@@ -410,55 +535,64 @@ contract DynamicRiskGovernor {
     }
     
     /**
-     * @dev Calculates the Sharpe Proxy using the Mean Absolute Deviation method.
+     * @dev Calculates the Sharpe Proxy with a gas-efficient two-pass method (MAD)
+     * that avoids large memory allocations and correctly calculates deviation
      */
-    function _calculateSharpeProxy(address module) private view returns (uint256) {
+function _calculateSharpeProxy(address module) private view returns (uint256) {
         DataStructures.ModuleSnapshotHistory storage history = moduleSnapshotHistories[module];
         uint8 count = history.snapshotCount;
         if (count < 2) return FixedPointMath.WAD; // Not enough data, return neutral
 
         uint8 lookbackN = moduleConfigs[module].lookbackPeriodN;
-
         // Calculate how many return periods we can analyze from the snapshots
         uint8 returnCount = count - 1;
 
-        // Create a temporary array in memory to hold the returns for the second pass
-        int256[] memory periodReturns = new int256[](returnCount);
+        // --- First Pass: Calculate Average Return ---
         int256 totalReturns = 0;
-
-        // --- First Pass: Calculate and store each period's return ---
         for (uint8 i = 0; i < returnCount; i++) {
-            // Ready data backwards from most recent entries
+            // Read data backwards from the most recent entries in the circular buffer
             uint8 currentIdx = (history.nextSnapshotIndex + lookbackN - 1 - i) % lookbackN;
             uint8 prevIdx = (history.nextSnapshotIndex + lookbackN - 2 - i) % lookbackN;
 
             uint256 currentNav = history.navPerShareHistory[currentIdx];
             uint256 prevNav = history.navPerShareHistory[prevIdx];
-            
+
             // Exception when prevNav=0, we skip this invalid period
             if (prevNav > 0) {
                 int256 r = int256(currentNav) - int256(prevNav);
-                // Calculate the percentage return for this period
-                int256 periodReturn = r.mulWad(int256(FixedPointMath.WAD)) / int256(prevNav);
-                periodReturns[i] = periodReturn;
-                totalReturns += periodReturn;
+                // Calculate and accumulate the percentage return for this period
+                totalReturns += r.mulWad(int256(FixedPointMath.WAD)) / int256(prevNav);
             }
         }
 
         // --- Calculations between passes ---
+        // Redundant calculation for gas efficiency
+        // Arithmetic calculations are cheaper than storage result and loopback
         int256 avgReturn = totalReturns / int256(returnCount);
         int256 excessReturn = avgReturn - int256(riskFreeRate);
 
         // --- Second Pass: Calculate Mean Absolute Deviation (MAD) ---
         int256 totalDeviation = 0;
         for (uint8 i = 0; i < returnCount; i++) {
-            if (sharpeMetricType == DataStructures.SharpeMetricType.DOWNSIDE_MAD) {
-                // Only consider returns less than the average for downside deviation
-                if (periodReturns[i] < avgReturn) {
-                    totalDeviation += Math.absDiff(avgReturn, periodReturns[i]);
+            // Read data backwards again to recalculate each period's return on-the-fly
+            uint8 currentIdx = (history.nextSnapshotIndex + lookbackN - 1 - i) % lookbackN;
+            uint8 prevIdx = (history.nextSnapshotIndex + lookbackN - 2 - i) % lookbackN;
+
+            uint256 currentNav = history.navPerShareHistory[currentIdx];
+            uint256 prevNav = history.navPerShareHistory[prevIdx];
+            
+            if (prevNav > 0) {
+                int256 r = int256(currentNav) - int256(prevNav);
+                int256 periodReturn = r.mulWad(int256(FixedPointMath.WAD)) / int256(prevNav);
+
+                if (sharpeMetricType == DataStructures.SharpeMetricType.DOWNSIDE_MAD) {
+                    // Only consider returns less than the average for downside deviation
+                    if (periodReturn < avgReturn) {
+                        totalDeviation += Math.absDiff(avgReturn, periodReturn);
+                    }
+                } else { // Full MAD
+                    totalDeviation += Math.absDiff(avgReturn, periodReturn);
                 }
-            } else { // Full MAD
-                totalDeviation += Math.absDiff(avgReturn, periodReturns[i]);
             }
         }
 
@@ -467,21 +601,21 @@ contract DynamicRiskGovernor {
         // --- Final Stability Checks ---
         if (mad == 0) return type(uint256).max; // No deviation, return max value
         
-        // Use the minimum threshold if calculated MAD is too low.
+        // Use the minimum threshold if calculated MAD is too low
         if (uint256(Math.abs(mad)) < minMadThreshold) {
             mad = int256(minMadThreshold);
         }
         
-        // Ensure we don't try to divide by a negative number if MAD is somehow negative.
+        // Ensure we don't try to divide by a negative number if MAD is somehow negative
         if (mad <= 0) return 0;
 
-        // Calculate the final ratio: Excess Return / Volatility (MAD).
+        // Calculate the final ratio: Excess Return / Volatility (MAD)
         return uint256(excessReturn).divWad(uint256(mad));
     }
         
     /**
     * @dev Calculates the final performance modifier based on Sharpe and MDD,
-    * using a piecewise linear function for the Sharpe Factor.
+    * using a piecewise linear function for the Sharpe Factor
     */
     function _calculatePerformanceModifier(
         address module,
@@ -529,41 +663,35 @@ contract DynamicRiskGovernor {
         return sharpeFactor.mulWad(FixedPointMath.WAD - mddPenaltyFactor);
     }
 
-
     /**
-    * @dev Calculates the short-term market trend using a Simple Moving Average (SMA).
-    * @param assetId The ID of the asset to analyze.
-    * @param newPrice The latest price from the oracle.
-    * @return trend -1 for negative, 1 for positive, 0 for neutral.
+    * @dev Calculates the short-term market trend using a Simple Moving Average (SMA)
+    * @notice Assume the history buffer has been initialized by registerModule
+    * @param assetId The ID of the asset to analyze
+    * @param newPrice The latest price from the oracle
+    * @return trend -1 for negative, 1 for positive, 0 for neutral
     */
     function _calculateSMATrend(uint32 assetId, uint256 newPrice) private returns (int8 trend) {
         DataStructures.PriceHistory storage history = assetPriceHistories[assetId];
-        uint8 lookback = trendLookback; // Governable parameter
-
-        // Initialize buffer if it's empty
-        if (history.prices.length != lookback) {
-            delete history.prices; // Clear any old data
-            for (uint i = 0; i < lookback; i++) {
-                history.prices.push(0);
-            }
-        }
+        uint8 lookback = trendLookback; 
+        
+        // Safety check to prevent DoS if lookback is accidentally set to 0 by governance.
+        require(lookback > 0 && lookback <= MAX_TREND_LOOKBACK, "Invalid trend lookback");
 
         // Update the circular buffer with the new price
         history.prices[history.nextWriteIndex] = newPrice;
         history.nextWriteIndex = (history.nextWriteIndex + 1) % lookback;
-
-        // Calculate the SMA
-        uint256 sum = 0;
-        uint8 points = 0;
-        for (uint8 i = 0; i < lookback; i++) {
-            if (history.prices[i] > 0) {
-                sum += history.prices[i];
-                points++;
-            }
+        if (history.pointsWritten < lookback) {
+            history.pointsWritten++;
         }
 
-        // Not enough data for a meaningful SMA yet
-        if (points < lookback) return 0;
+        // Not enough data for a meaningful SMA yet, Use the state variable directly for the warm-up check
+        if (history.pointsWritten < lookback) return 0; // Return neutral trend
+
+        // Calculate the SMA by iterating only over the valid points
+        uint256 sum = 0;
+        for (uint8 i = 0; i < lookback; i++) {
+            sum += history.prices[i];
+        }
 
         uint256 sma = sum / lookback;
 

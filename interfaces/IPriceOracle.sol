@@ -13,4 +13,4 @@ interface IPriceOracle {
      * @return price The latest price of the asset, returned with 18 decimals of precision.
      */
     function latestPrice() external view returns (uint256 price);
-}
+} 
